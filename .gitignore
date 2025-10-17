@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pycache/
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Virtual environment
+venv/
+env/
+ENV/
+*.venv/
+
+# Flask / web
+instance/
+.webassets-cache
+*.db
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# PyCharm / IDEs
+.idea/
+.vscode/
+*.iml
+
+# Audio/temp files
+*.wav
+*.webm
+*.ogg
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
