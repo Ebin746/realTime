@@ -9,32 +9,66 @@ import time
 import traceback
 import wave
 import numpy as np
-import json  # ADD THIS IMPORT
+import json
+import torch
 
 app = Flask(__name__)
 CORS(app)
 sock = Sock(app)
 
 # Configuration
-CHUNK_DURATION = 1.5  # Process every 1.5 seconds
-OVERLAP_DURATION = 0.5  # Keep 0.5s overlap for continuity
+CHUNK_DURATION = 3.0  # Increased from 1.5s for better context
+OVERLAP_DURATION = 0.3  # Reduced from 0.5s
 SAMPLE_RATE = 16000
 CHANNELS = 1
-SAMPLE_WIDTH = 2  # 16-bit
+SAMPLE_WIDTH = 2
 
-print("Loading Whisper model...")
-model = whisper.load_model("tiny")
+# VAD Configuration
+VAD_THRESHOLD = 0.5  # Speech probability threshold
+ENERGY_THRESHOLD = 0.01  # Minimum energy to consider processing
+MIN_SPEECH_DURATION = 0.8  # Minimum speech duration in seconds
+
+print("Loading Whisper model (base)...")
+model = whisper.load_model("base")  # Upgraded from "tiny"
 print("Model loaded!")
+
+print("Loading Silero VAD model...")
+vad_model, utils = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad',
+    model='silero_vad',
+    force_reload=False,
+    onnx=False
+)
+(get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
+print("VAD model loaded!")
+
+# Common hallucination phrases to filter
+HALLUCINATION_PHRASES = {
+    'thank you for watching',
+    'thanks for watching',
+    'subscribe',
+    'like and subscribe',
+    'please subscribe',
+    'don\'t forget to subscribe',
+    'hit the bell',
+    'leave a comment',
+    'see you next time',
+    'bye bye',
+    'you',  # Single word hallucinations
+    'thank you',
+    'thanks',
+}
 
 class TranscriptionSession:
     def __init__(self, ws):
         self.ws = ws
-        self.audio_buffer = np.array([], dtype=np.int16)  # Raw PCM buffer
-        self.overlap_buffer = np.array([], dtype=np.int16)  # Overlap buffer
+        self.audio_buffer = np.array([], dtype=np.int16)
+        self.overlap_buffer = np.array([], dtype=np.int16)
         self.is_recording = False
         self.processing_thread = None
         self.lock = threading.Lock()
         self.chunk_counter = 0
+        self.last_transcription = ""  # Track for deduplication
         
     def add_audio_data(self, pcm_data):
         """Add raw PCM audio data (Int16 array)"""
@@ -46,6 +80,68 @@ class TranscriptionSession:
         """Calculate number of samples for given duration"""
         return int(SAMPLE_RATE * duration)
     
+    def check_energy(self, audio_array):
+        """Check if audio has sufficient energy (not silence)"""
+        audio_float = audio_array.astype(np.float32) / 32768.0
+        energy = np.mean(np.abs(audio_float))
+        return energy > ENERGY_THRESHOLD
+    
+    def detect_speech_vad(self, audio_array):
+        """Use Silero VAD to detect speech in audio"""
+        try:
+            # Convert to float32 in range [-1, 1]
+            audio_float = audio_array.astype(np.float32) / 32768.0
+            audio_tensor = torch.from_numpy(audio_float)
+            
+            # Get speech timestamps
+            speech_timestamps = get_speech_timestamps(
+                audio_tensor,
+                vad_model,
+                sampling_rate=SAMPLE_RATE,
+                threshold=VAD_THRESHOLD,
+                min_speech_duration_ms=int(MIN_SPEECH_DURATION * 1000),
+                min_silence_duration_ms=300,
+            )
+            
+            # Calculate total speech duration
+            if speech_timestamps:
+                total_speech_samples = sum(
+                    ts['end'] - ts['start'] for ts in speech_timestamps
+                )
+                speech_ratio = total_speech_samples / len(audio_array)
+                return speech_ratio > 0.3  # At least 30% speech
+            return False
+            
+        except Exception as e:
+            print(f"VAD error: {e}")
+            return True  # Default to processing if VAD fails
+    
+    def is_hallucination(self, text):
+        """Check if transcription is likely a hallucination"""
+        text_lower = text.lower().strip()
+        
+        # Check for common hallucination phrases
+        for phrase in HALLUCINATION_PHRASES:
+            if phrase in text_lower:
+                return True
+        
+        # Filter very short transcriptions
+        word_count = len(text.split())
+        if word_count < 2:
+            return True
+        
+        # Filter if too similar to last transcription (duplicate)
+        if self.last_transcription and text_lower == self.last_transcription.lower():
+            return True
+        
+        # Filter repetitive patterns
+        words = text_lower.split()
+        if len(words) >= 4:
+            if len(set(words)) / len(words) < 0.5:  # Less than 50% unique words
+                return True
+        
+        return False
+    
     def process_audio_loop(self):
         """Background thread that processes audio chunks"""
         chunk_samples = self.get_samples_for_duration(CHUNK_DURATION)
@@ -54,19 +150,18 @@ class TranscriptionSession:
         print(f"Processing loop started")
         print(f"Chunk: {CHUNK_DURATION}s ({chunk_samples} samples)")
         print(f"Overlap: {OVERLAP_DURATION}s ({overlap_samples} samples)")
+        print(f"VAD threshold: {VAD_THRESHOLD}")
+        print(f"Energy threshold: {ENERGY_THRESHOLD}")
         
         while self.is_recording:
             try:
-                time.sleep(0.3)  # Check every 300ms
+                time.sleep(0.3)
                 
-                # Check buffer size
                 with self.lock:
                     buffer_samples = len(self.audio_buffer)
                 
-                # Process if we have enough data
                 if buffer_samples >= chunk_samples:
                     with self.lock:
-                        # Get audio to process (overlap + new chunk)
                         if len(self.overlap_buffer) > 0:
                             process_audio = np.concatenate([
                                 self.overlap_buffer,
@@ -75,14 +170,20 @@ class TranscriptionSession:
                         else:
                             process_audio = self.audio_buffer[:chunk_samples]
                         
-                        # Save overlap for next iteration
                         overlap_start = max(0, chunk_samples - overlap_samples)
                         self.overlap_buffer = self.audio_buffer[overlap_start:chunk_samples].copy()
-                        
-                        # Remove processed samples
                         self.audio_buffer = self.audio_buffer[chunk_samples:]
                     
-                    # Transcribe outside the lock
+                    # Pre-flight checks before transcription
+                    if not self.check_energy(process_audio):
+                        print("⊘ Skipped: Insufficient energy (silence)")
+                        continue
+                    
+                    if not self.detect_speech_vad(process_audio):
+                        print("⊘ Skipped: No speech detected by VAD")
+                        continue
+                    
+                    # Transcribe if passes all checks
                     self.transcribe_audio_array(process_audio)
                     
             except Exception as e:
@@ -96,9 +197,9 @@ class TranscriptionSession:
                 except:
                     pass
         
-        # Process remaining audio when recording stops
+        # Process remaining audio
         with self.lock:
-            min_samples = self.get_samples_for_duration(0.5)
+            min_samples = self.get_samples_for_duration(0.8)
             if len(self.audio_buffer) >= min_samples:
                 if len(self.overlap_buffer) > 0:
                     final_audio = np.concatenate([self.overlap_buffer, self.audio_buffer])
@@ -109,14 +210,14 @@ class TranscriptionSession:
             else:
                 final_audio = None
         
-        if final_audio is not None:
+        if final_audio is not None and self.check_energy(final_audio):
             print(f"Processing final chunk: {len(final_audio)} samples")
             self.transcribe_audio_array(final_audio)
         
         print("Processing loop ended")
     
     def transcribe_audio_array(self, audio_array):
-        """Transcribe a numpy audio array (int16)"""
+        """Transcribe a numpy audio array with improved settings"""
         temp_path = None
         try:
             self.chunk_counter += 1
@@ -130,7 +231,6 @@ class TranscriptionSession:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                 temp_path = temp_wav.name
             
-            # Save as WAV
             with wave.open(temp_path, 'wb') as wav_file:
                 wav_file.setnchannels(CHANNELS)
                 wav_file.setsampwidth(SAMPLE_WIDTH)
@@ -139,19 +239,42 @@ class TranscriptionSession:
             
             print("Transcribing...")
             
-            # Transcribe
-            result = model.transcribe(temp_path, language=None, fp16=False)
+            # Improved transcription settings
+            result = model.transcribe(
+                temp_path,
+                language='en',  # Set your language explicitly
+                fp16=False,
+                condition_on_previous_text=True,  # Better continuity
+                no_speech_threshold=0.6,  # Filter silence
+                logprob_threshold=-1.0,  # Filter low confidence
+                compression_ratio_threshold=2.4,  # Filter repetitive text
+            )
+            
             text = result["text"].strip()
             
-            if text:
-                print(f"✓ Transcription: '{text}'")
-                # IMPORTANT: Send as JSON string
-                self.ws.send(json.dumps({
-                    'type': 'transcription',
-                    'text': text
-                }))
-            else:
-                print("✗ No speech detected")
+            # Post-processing filters
+            if not text:
+                print("✗ Empty transcription")
+                return
+            
+            if self.is_hallucination(text):
+                print(f"✗ Filtered hallucination: '{text}'")
+                return
+            
+            # Check average log probability for confidence
+            if 'segments' in result and result['segments']:
+                avg_logprob = np.mean([seg.get('avg_logprob', 0) for seg in result['segments']])
+                if avg_logprob < -1.0:  # Low confidence
+                    print(f"✗ Low confidence: '{text}' (logprob: {avg_logprob:.2f})")
+                    return
+            
+            print(f"✓ Transcription: '{text}'")
+            self.last_transcription = text
+            
+            self.ws.send(json.dumps({
+                'type': 'transcription',
+                'text': text
+            }))
             
         except Exception as e:
             print(f"Transcription error: {e}")
@@ -177,6 +300,7 @@ class TranscriptionSession:
             self.audio_buffer = np.array([], dtype=np.int16)
             self.overlap_buffer = np.array([], dtype=np.int16)
             self.chunk_counter = 0
+            self.last_transcription = ""
         
         self.processing_thread = threading.Thread(target=self.process_audio_loop, daemon=True)
         self.processing_thread.start()
@@ -198,7 +322,6 @@ def transcribe_socket(ws):
     session = TranscriptionSession(ws)
     
     try:
-        # Send connection confirmation as JSON
         ws.send(json.dumps({'type': 'status', 'message': 'Connected to transcription server'}))
         
         while True:
@@ -209,7 +332,6 @@ def transcribe_socket(ws):
                     print("Received None message, connection closing")
                     break
                 
-                # Handle text messages (control signals)
                 if isinstance(message, str):
                     try:
                         data = json.loads(message)
@@ -226,13 +348,9 @@ def transcribe_socket(ws):
                     except json.JSONDecodeError as e:
                         print(f"JSON decode error: {e}")
                 
-                # Handle binary messages (raw PCM audio data)
                 elif isinstance(message, bytes):
                     if session.is_recording:
                         session.add_audio_data(message)
-                        # Optional: print buffer status occasionally
-                        if len(session.audio_buffer) % (16000 * 2) < 8192:
-                            print(f"📊 Buffer: {len(session.audio_buffer)} samples ({len(session.audio_buffer)/16000:.1f}s)")
                     else:
                         print("⚠️ Received audio but not recording")
             
@@ -253,9 +371,10 @@ def transcribe_socket(ws):
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("🎤 Real-Time Transcription Server with Chunked Processing")
+    print("🎤 Real-Time Transcription Server (Enhanced)")
     print("="*60)
     print(f"Backend:  http://127.0.0.1:5000")
+    print(f"Model:    Whisper Base + Silero VAD")
     print(f"Chunk:    {CHUNK_DURATION}s")
     print(f"Overlap:  {OVERLAP_DURATION}s")
     print(f"Sample:   {SAMPLE_RATE}Hz, {SAMPLE_WIDTH*8}-bit")
