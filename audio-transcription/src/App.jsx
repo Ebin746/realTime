@@ -1,4 +1,120 @@
 import React, { useState, useEffect, useRef } from 'react';
+import styled from 'styled-components';
+
+const Container = styled.div`
+  padding: 20px;
+  max-width: 800px;
+  margin: 0 auto;
+  font-family: system-ui, -apple-system, sans-serif;
+`;
+
+const Title = styled.h1`
+  margin-bottom: 24px;
+`;
+
+const StatusBox = styled.div`
+  padding: 16px;
+  margin-bottom: 20px;
+  background-color: #f3f4f6;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+`;
+
+const StatusRow = styled.div`
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const StatusIndicator = styled.div`
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: ${props => props.color};
+  animation: ${props => props.isRecording ? 'pulse 2s infinite' : 'none'};
+`;
+
+const StatusLabel = styled.strong`
+`;
+
+const StatusText = styled.span`
+  margin-left: 8px;
+  color: #6b7280;
+`;
+
+const ConnectionStatus = styled.div`
+  font-size: 14px;
+  color: #6b7280;
+`;
+
+const ButtonGroup = styled.div`
+  margin-bottom: 24px;
+  display: flex;
+  gap: 12px;
+`;
+
+const Button = styled.button`
+  padding: 12px 24px;
+  font-size: 16px;
+  font-weight: 600;
+  background-color: ${props => props.disabled ? '#e5e7eb' : props.bgColor};
+  color: ${props => props.disabled ? '#9ca3af' : 'white'};
+  border: none;
+  border-radius: 8px;
+  cursor: ${props => props.disabled ? 'not-allowed' : 'pointer'};
+  transition: all 0.2s;
+`;
+
+const TranscriptionBox = styled.div`
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px;
+  min-height: 300px;
+  max-height: 500px;
+  overflow-y: auto;
+  background-color: #ffffff;
+`;
+
+const TranscriptionTitle = styled.h3`
+  margin-top: 0;
+  margin-bottom: 16px;
+`;
+
+const EmptyTranscription = styled.p`
+  color: #9ca3af;
+  text-align: center;
+  padding: 40px 20px;
+`;
+
+const TranscriptionItem = styled.div`
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  background-color: #f9fafb;
+  border-left: 4px solid #22c55e;
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+`;
+
+const Timestamp = styled.div`
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 6px;
+  font-weight: 500;
+`;
+
+const TranscriptionText = styled.div`
+  font-size: 16px;
+  line-height: 1.5;
+  color: #111827;
+`;
+
+const GlobalStyles = styled.div`
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+`;
 
 export default function RealtimeTranscription() {
   const [isRecording, setIsRecording] = useState(false);
@@ -12,7 +128,7 @@ export default function RealtimeTranscription() {
   const streamRef = useRef(null);
   const isRecordingRef = useRef(false);
   const reconnectTimeoutRef = useRef(null);
-  const isConnectingRef = useRef(false); // Prevent duplicate connections
+  const isConnectingRef = useRef(false);
 
   useEffect(() => {
     connectWebSocket();
@@ -23,7 +139,6 @@ export default function RealtimeTranscription() {
   }, []);
 
   const connectWebSocket = () => {
-    // Prevent multiple simultaneous connection attempts
     if (isConnectingRef.current || (wsRef.current && wsRef.current.readyState === WebSocket.OPEN)) {
       console.log('Connection already exists or is in progress');
       return;
@@ -32,7 +147,6 @@ export default function RealtimeTranscription() {
     isConnectingRef.current = true;
 
     try {
-      // Close existing connection if any
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
@@ -80,17 +194,14 @@ export default function RealtimeTranscription() {
         setWsConnected(false);
         setStatus('Disconnected');
         
-        // Stop recording if active
         if (isRecordingRef.current) {
           stopRecording();
         }
         
-        // Clear any existing reconnect timeout
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
         }
         
-        // Attempt to reconnect after 3 seconds
         reconnectTimeoutRef.current = setTimeout(() => {
           console.log('Attempting to reconnect...');
           connectWebSocket();
@@ -107,7 +218,6 @@ export default function RealtimeTranscription() {
 
   const startRecording = async () => {
     try {
-      // Verify WebSocket is connected
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
         setStatus('WebSocket not connected. Please wait...');
         return;
@@ -125,7 +235,6 @@ export default function RealtimeTranscription() {
       
       streamRef.current = stream;
       
-      // Create AudioContext
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 16000
       });
@@ -133,36 +242,30 @@ export default function RealtimeTranscription() {
       
       const source = audioContext.createMediaStreamSource(stream);
       
-      // Create ScriptProcessor for raw PCM capture
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
       
-      // Set recording state BEFORE setting up the processor
       isRecordingRef.current = true;
       setIsRecording(true);
       setStatus('Recording... speak now!');
       setTranscriptions([]);
       
-      // Send start signal FIRST
       wsRef.current.send(JSON.stringify({ type: 'start' }));
       console.log('✓ Sent start signal to WebSocket');
       
       processor.onaudioprocess = (e) => {
-        // Use ref instead of state to avoid stale closure
         if (!isRecordingRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
           return;
         }
         
         const inputData = e.inputBuffer.getChannelData(0);
         
-        // Convert Float32 to Int16
         const int16Data = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
           const s = Math.max(-1, Math.min(1, inputData[i]));
           int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         
-        // Send raw PCM data
         try {
           wsRef.current.send(int16Data.buffer);
         } catch (err) {
@@ -200,7 +303,6 @@ export default function RealtimeTranscription() {
       streamRef.current = null;
     }
     
-    // Send stop signal
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'stop' }));
       console.log('✓ Sent stop signal to WebSocket');
@@ -210,7 +312,6 @@ export default function RealtimeTranscription() {
   };
 
   const cleanup = () => {
-    // Clear reconnect timeout
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
     }
@@ -232,113 +333,55 @@ export default function RealtimeTranscription() {
   };
 
   return (
-    <div style={{ padding: '20px', maxWidth: '800px', margin: '0 auto', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-      <h1 style={{ marginBottom: '24px' }}>🎤 Real-Time Audio Transcription</h1>
-      
-      <div style={{ 
-        padding: '16px', 
-        marginBottom: '20px', 
-        backgroundColor: '#f3f4f6',
-        borderRadius: '8px',
-        border: '1px solid #e5e7eb'
-      }}>
-        <div style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div style={{ 
-            width: '10px',
-            height: '10px',
-            borderRadius: '50%',
-            backgroundColor: getStatusColor(),
-            animation: isRecording ? 'pulse 2s infinite' : 'none'
-          }} />
-          <strong>Status:</strong> 
-          <span style={{ marginLeft: '8px', color: '#6b7280' }}>{status}</span>
-        </div>
-        <div style={{ fontSize: '14px', color: '#6b7280' }}>
-          {wsConnected ? '✓ Connected to server' : '✗ Disconnected from server'}
-        </div>
-      </div>
-      
-      <div style={{ marginBottom: '24px', display: 'flex', gap: '12px' }}>
-        <button
-          onClick={startRecording}
-          disabled={isRecording || !wsConnected}
-          style={{
-            padding: '12px 24px',
-            fontSize: '16px',
-            fontWeight: '600',
-            backgroundColor: isRecording || !wsConnected ? '#e5e7eb' : '#22c55e',
-            color: isRecording || !wsConnected ? '#9ca3af' : 'white',
-            border: 'none',
-            borderRadius: '8px',
-            cursor: isRecording || !wsConnected ? 'not-allowed' : 'pointer',
-            transition: 'all 0.2s'
-          }}
-        >
-          🎙️ Start Recording
-        </button>
+    <GlobalStyles>
+      <Container>
+        <Title>🎤 Real-Time Audio Transcription</Title>
         
-        <button
-          onClick={stopRecording}
-          disabled={!isRecording}
-          style={{
-            padding: '12px 24px',
-            fontSize: '16px',
-            fontWeight: '600',
-            backgroundColor: !isRecording ? '#e5e7eb' : '#ef4444',
-            color: !isRecording ? '#9ca3af' : 'white',
-            border: 'none',
-            borderRadius: '8px',
-            cursor: !isRecording ? 'not-allowed' : 'pointer',
-            transition: 'all 0.2s'
-          }}
-        >
-          ⏹️ Stop Recording
-        </button>
-      </div>
-      
-      <div style={{
-        border: '1px solid #e5e7eb',
-        borderRadius: '8px',
-        padding: '16px',
-        minHeight: '300px',
-        maxHeight: '500px',
-        overflowY: 'auto',
-        backgroundColor: '#ffffff'
-      }}>
-        <h3 style={{ marginTop: '0', marginBottom: '16px' }}>📝 Transcriptions:</h3>
-        {transcriptions.length === 0 ? (
-          <p style={{ color: '#9ca3af', textAlign: 'center', padding: '40px 20px' }}>
-            No transcriptions yet. Click "Start Recording" and speak to see results.
-          </p>
-        ) : (
-          transcriptions.map((item, idx) => (
-            <div key={idx} style={{
-              padding: '12px 16px',
-              marginBottom: '12px',
-              backgroundColor: '#f9fafb',
-              borderLeft: '4px solid #22c55e',
-              borderRadius: '4px',
-              boxShadow: '0 1px 2px rgba(0,0,0,0.05)'
-            }}>
-              <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px', fontWeight: '500' }}>
-                {item.timestamp}
-              </div>
-              <div style={{ fontSize: '16px', lineHeight: '1.5', color: '#111827' }}>
-                {item.text}
-              </div>
-            </div>
-          ))
-        )}
-      </div>
-      
-      <style>
-        {`
-          @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-          }
-        `}
-      </style>
-    </div>
+        <StatusBox>
+          <StatusRow>
+            <StatusIndicator color={getStatusColor()} isRecording={isRecording} />
+            <StatusLabel>Status:</StatusLabel>
+            <StatusText>{status}</StatusText>
+          </StatusRow>
+          <ConnectionStatus>
+            {wsConnected ? '✓ Connected to server' : '✗ Disconnected from server'}
+          </ConnectionStatus>
+        </StatusBox>
+        
+        <ButtonGroup>
+          <Button
+            onClick={startRecording}
+            disabled={isRecording || !wsConnected}
+            bgColor="#22c55e"
+          >
+            🎙️ Start Recording
+          </Button>
+          
+          <Button
+            onClick={stopRecording}
+            disabled={!isRecording}
+            bgColor="#ef4444"
+          >
+            ⏹️ Stop Recording
+          </Button>
+        </ButtonGroup>
+        
+        <TranscriptionBox>
+          <TranscriptionTitle>📝 Transcriptions:</TranscriptionTitle>
+          {transcriptions.length === 0 ? (
+            <EmptyTranscription>
+              No transcriptions yet. Click "Start Recording" and speak to see results.
+            </EmptyTranscription>
+          ) : (
+            transcriptions.map((item, idx) => (
+              <TranscriptionItem key={idx}>
+                <Timestamp>{item.timestamp}</Timestamp>
+                <TranscriptionText>{item.text}</TranscriptionText>
+              </TranscriptionItem>
+            ))
+          )}
+        </TranscriptionBox>
+      </Container>
+    </GlobalStyles>
   );
 }
